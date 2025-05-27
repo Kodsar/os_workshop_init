@@ -7,10 +7,7 @@
 
 channel_t *make_ch() {
     channel_t *ch = malloc(sizeof(channel_t));
-    if (!ch) {
-        perror("malloc");
-        exit(EXIT_FAILURE);
-    }
+
     ch->head = 0;
     ch->tail = 0;
     ch->size = 0;
