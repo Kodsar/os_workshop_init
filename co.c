@@ -4,92 +4,90 @@
 #include <unistd.h>
 #include <stdatomic.h>
 #include <signal.h>
-#ifdef __linux__
-#include <sys/prctl.h>
-#include <bits/types/sigset_t.h>
-#include <bits/sigaction.h>
-#else
-// macOS includes
-#include <signal.h>
-#endif
+#include <pthread.h>
 
-typedef struct {
-    task_t tasks[TASK_QUEUE_SIZE];
-    int head, tail;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-} task_queue_t;
 
-task_queue_t task_queue = {.head = 0, .tail = 0, .mutex = PTHREAD_MUTEX_INITIALIZER, .cond = PTHREAD_COND_INITIALIZER};
-pthread_t workers[WORKER_COUNT];
-atomic_bool running = true;
-atomic_bool workers_init = false;
+static task_t task_queue[TASK_QUEUE_SIZE];
+static int front = 0;   
+static int rear = 0;   
 
-void task_queue_push(task_func_t func, void *arg) {
-    pthread_mutex_lock(&task_queue.mutex);
-    task_t task = {func, arg};
-    task_queue.tasks[task_queue.tail] = task;
-    task_queue.tail = (task_queue.tail + 1) % TASK_QUEUE_SIZE;
-    pthread_cond_signal(&task_queue.cond);
-    pthread_mutex_unlock(&task_queue.mutex);
-}
+//one task at a time
+static pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t queue_not_empty = PTHREAD_COND_INITIALIZER;
 
-task_t task_queue_pop() {
-    pthread_mutex_lock(&task_queue.mutex);
-    while (task_queue.head == task_queue.tail && running) {
-        pthread_cond_wait(&task_queue.cond, &task_queue.mutex);
-    }
-    task_t task = task_queue.tasks[task_queue.head];
-    task_queue.head = (task_queue.head + 1) % TASK_QUEUE_SIZE;
-    pthread_mutex_unlock(&task_queue.mutex);
-    return task;
-}
 
-void *worker_thread(void *arg) {
-    int thread_id = *(int*) arg;
-    char thread_name[32];
-    sprintf(thread_name, "Worker-%d", thread_id);
-    #ifdef __linux__
-    prctl(PR_SET_NAME, thread_name, 0, 0, 0);
-    #endif
+static pthread_t workers[WORKER_COUNT];
 
-    while (running) {
-        task_t task = task_queue_pop();
-        if (task.func) {
-            task.func(task.arg);
+static atomic_bool running = false;
+
+void *co_worker(void *arg) {
+    (void)arg; 
+
+    while (atomic_load(&running)) {
+        pthread_mutex_lock(&queue_lock);
+
+        while (front == rear && atomic_load(&running)) {
+            pthread_cond_wait(&queue_not_empty, &queue_lock);
         }
+
+        if (!atomic_load(&running)) {
+            pthread_mutex_unlock(&queue_lock);
+            break;
+        }
+
+        task_t t = task_queue[front];
+        front = (front + 1) % TASK_QUEUE_SIZE;
+
+        pthread_mutex_unlock(&queue_lock);
+
+        t.func(t.arg);
     }
 
-    free(arg);
     return NULL;
 }
 
 void co_init() {
-    if (workers_init) return;
-    int worker_ids[WORKER_COUNT];
-    for (int i = 0; i < WORKER_COUNT; i++) {
-        worker_ids[i] = i + 1;
-    }
-    for (int i = 0; i < WORKER_COUNT; i++) {
-        int *thread_id = malloc(sizeof(int));
-        *thread_id = i + 1;
-        pthread_create(&workers[i], NULL, worker_thread, (void*) thread_id);
-    }
+    atomic_store(&running, true);
 
-    workers_init = true;
+    for (int i = 0; i < WORKER_COUNT; i++) {
+        if (pthread_create(&workers[i], NULL, co_worker, NULL) != 0) {
+            perror("pthread_create");
+            exit(EXIT_FAILURE);
+        }
+    }
 }
 
 void co_shutdown() {
-    running = false;
-    pthread_cond_broadcast(&task_queue.cond);
+    atomic_store(&running, false);
+
+    pthread_mutex_lock(&queue_lock);
+    pthread_cond_broadcast(&queue_not_empty);
+    pthread_mutex_unlock(&queue_lock);
+
     for (int i = 0; i < WORKER_COUNT; i++) {
         pthread_join(workers[i], NULL);
     }
 }
 
 void co(task_func_t func, void *arg) {
-    task_queue_push(func, arg);
+    pthread_mutex_lock(&queue_lock);
+
+    int next_rear = (rear + 1) % TASK_QUEUE_SIZE;
+
+    if (next_rear == front) {
+        fprintf(stderr, "Task queue is full! Task dropped.\n");
+        pthread_mutex_unlock(&queue_lock);
+        return;
+    }
+
+    task_queue[rear].func = func;
+    task_queue[rear].arg = arg;
+    rear = next_rear;
+
+    pthread_cond_signal(&queue_not_empty);
+    pthread_mutex_unlock(&queue_lock);
 }
+
 
 
 int wait_sig() {
